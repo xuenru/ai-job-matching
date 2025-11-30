@@ -3,6 +3,8 @@
 import argparse
 import sys
 
+from dotenv import load_dotenv
+
 from core.logger import get_logger
 from core.utils import get_cache
 from workflows.match_jobs import match_jobs_workflow
@@ -10,6 +12,8 @@ from workflows.parse_jobs import parse_jobs_workflow
 from workflows.parse_resume import parse_resume_workflow
 from workflows.run_all import run_all_workflow
 
+# Load environment variables
+load_dotenv()
 
 def main():
     """Main CLI entry point."""

@@ -11,14 +11,36 @@ from core.utils import get_all_job_files, get_cache, read_markdown_file, write_j
 class JobAgent:
     """Agent responsible for parsing job posting markdown into structured JSON."""
 
-    def __init__(self, model_name: str = "gemini-2.0-flash-exp"):
+    def __init__(self, model_name: str = "gemini-2.5-flash-lite"):
         self.model_name = model_name
         self.cache = get_cache()
         self.logger = get_logger()
 
-        # Initialize ADK client (optional - for real LLM calls)
-        # For prototype, we use deterministic parsing
-        self.use_llm = False
+        # Initialize ADK agent
+        self.use_llm = True
+        try:
+            import uuid
+
+            from google.adk import Runner
+            from google.adk.agents.llm_agent import Agent
+            from google.adk.sessions import InMemorySessionService
+            from google.genai.types import Content, Part
+
+            self.agent = Agent(
+                model=model_name,
+                name="job_parser",
+                description="Parses job postings into structured JSON.",
+                instruction="You are an expert job posting parser. Your goal is to extract structured information from a job posting markdown text and output it as a valid JSON object.",
+            )
+            self.session_service = InMemorySessionService()
+            self.app_name = "agents"
+            self.Runner = Runner
+            self.Content = Content
+            self.Part = Part
+            self.uuid = uuid
+        except ImportError:
+            self.logger.error("google-adk not installed. Falling back to deterministic parsing.")
+            self.use_llm = False
 
     def parse_job(self, job_path: str, use_cache: bool = True) -> JobSchema:
         """
@@ -44,9 +66,13 @@ class JobAgent:
         # Read job file
         job_text = read_markdown_file(job_path)
 
-        # Parse job (deterministic for prototype)
+        # Parse job
         if self.use_llm:
-            job_data = self._parse_with_llm(job_text, job_id)
+            try:
+                job_data = self._parse_with_llm(job_text, job_id)
+            except Exception as e:
+                self.logger.error(f"LLM parsing failed: {e}. Falling back to deterministic.")
+                job_data = self._parse_deterministic(job_text, job_id)
         else:
             job_data = self._parse_deterministic(job_text, job_id)
 
@@ -90,6 +116,7 @@ class JobAgent:
         Deterministic parsing logic for prototype.
         Extracts structured data from job posting markdown.
         """
+        self.logger.info("Parsing job deterministically...")
         lines = job_text.split("\n")
 
         title = ""
@@ -196,10 +223,84 @@ class JobAgent:
 
     def _parse_with_llm(self, job_text: str, job_id: str) -> dict[str, Any]:
         """
-        Parse job using LLM (for future implementation).
+        Parse job using LLM.
         """
+        self.logger.info("Parsing job with LLM...")
         self.logger.increment_metric("llm_calls")
 
-        # This would use ADK's LLM capabilities
-        # For now, fall back to deterministic
-        return self._parse_deterministic(job_text, job_id)
+        prompt = f"""
+        Parse the following job posting markdown into a JSON object with the following structure:
+        {{
+            "id": "{job_id}",
+            "title": str,
+            "company": str,
+            "location": str,
+            "contract": str,
+            "responsibilities": str,
+            "requirements": list[str],
+            "nice_to_have": list[str],
+            "seniority": str (Junior, Mid, Senior),
+            "raw_text": str (original text)
+        }}
+
+        Job Posting:
+        {job_text}
+
+        Return ONLY the JSON object, no markdown formatting.
+        IMPORTANT: Use empty strings "" for missing values, do NOT use null.
+        """
+
+        # Create session ID
+        session_id = str(self.uuid.uuid4())
+
+        # Create runner
+        runner = self.Runner(
+            agent=self.agent, app_name=self.app_name, session_service=self.session_service
+        )
+
+        # Run async wrapper
+        import asyncio
+
+        async def run_agent():
+            # Create session async
+            await self.session_service.create_session(
+                app_name=self.app_name, session_id=session_id, user_id="user"
+            )
+
+            content = self.Content(role="user", parts=[self.Part(text=prompt)])
+            events_list = []
+            async for event in runner.run_async(
+                user_id="user", session_id=session_id, new_message=content
+            ):
+                events_list.append(event)
+            return events_list
+
+        try:
+            events = asyncio.run(run_agent())
+        except Exception as e:
+            self.logger.error(f"Async run failed: {e}")
+            raise e
+
+        response_text = ""
+        for event in events:
+            if hasattr(event, "content") and event.content and event.content.parts:
+                for part in event.content.parts:
+                    if part.text:
+                        response_text += part.text
+
+        # Parse JSON
+        import json
+        import re
+
+        json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(0)
+            data = json.loads(json_str)
+        else:
+            data = json.loads(response_text)
+
+        # Ensure ID and raw_text are correct
+        data["id"] = job_id
+        data["raw_text"] = job_text
+
+        return data

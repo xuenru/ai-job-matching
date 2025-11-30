@@ -10,14 +10,36 @@ from core.utils import get_cache, read_markdown_file, write_json_file
 class CVAgent:
     """Agent responsible for parsing resume markdown into structured JSON."""
 
-    def __init__(self, model_name: str = "gemini-2.0-flash-exp"):
+    def __init__(self, model_name: str = "gemini-2.5-flash-lite"):
         self.model_name = model_name
         self.cache = get_cache()
         self.logger = get_logger()
 
-        # Initialize ADK client (optional - for real LLM calls)
-        # For prototype, we use deterministic parsing
-        self.use_llm = False
+        # Initialize ADK agent
+        self.use_llm = True
+        try:
+            import uuid
+
+            from google.adk import Runner
+            from google.adk.agents.llm_agent import Agent
+            from google.adk.sessions import InMemorySessionService
+            from google.genai.types import Content, Part
+
+            self.agent = Agent(
+                model=model_name,
+                name="cv_parser",
+                description="Parses resumes into structured JSON.",
+                instruction="You are an expert resume parser. Your goal is to extract structured information from a resume markdown text and output it as a valid JSON object.",
+            )
+            self.session_service = InMemorySessionService()
+            self.app_name = "agents"
+            self.Runner = Runner
+            self.Content = Content
+            self.Part = Part
+            self.uuid = uuid
+        except ImportError:
+            self.logger.error("google-adk not installed. Falling back to deterministic parsing.")
+            self.use_llm = False
 
     def parse_resume(self, resume_path: str, use_cache: bool = True) -> ResumeSchema:
         """
@@ -40,9 +62,13 @@ class CVAgent:
         # Read resume file
         resume_text = read_markdown_file(resume_path)
 
-        # Parse resume (deterministic for prototype)
+        # Parse resume
         if self.use_llm:
-            resume_data = self._parse_with_llm(resume_text)
+            try:
+                resume_data = self._parse_with_llm(resume_text)
+            except Exception as e:
+                self.logger.error(f"LLM parsing failed: {e}. Falling back to deterministic.")
+                resume_data = self._parse_deterministic(resume_text)
         else:
             resume_data = self._parse_deterministic(resume_text)
 
@@ -64,6 +90,7 @@ class CVAgent:
         Deterministic parsing logic for prototype.
         Extracts structured data from resume markdown.
         """
+        self.logger.info("Parsing resume deterministically...")
         lines = resume_text.split("\n")
 
         # Extract name (first line, usually a heading)
@@ -220,10 +247,81 @@ class CVAgent:
 
     def _parse_with_llm(self, resume_text: str) -> dict[str, Any]:
         """
-        Parse resume using LLM (for future implementation).
+        Parse resume using LLM.
         """
+        self.logger.info("Parsing resume with LLM...")
         self.logger.increment_metric("llm_calls")
 
-        # This would use ADK's LLM capabilities
-        # For now, fall back to deterministic
-        return self._parse_deterministic(resume_text)
+        prompt = f"""
+        Parse the following resume markdown into a JSON object with the following structure:
+        {{
+            "name": str,
+            "contact": {{ "email": str, "location": str }},
+            "years_of_experience": int,
+            "seniority": str (Junior, Mid, Senior),
+            "skills": list[str],
+            "domains": list[str],
+            "languages": list[str],
+            "education": list[str],
+            "projects": list[str],
+            "preferred_location": str,
+            "other_notes": str
+        }}
+
+        Resume Text:
+        {resume_text}
+
+        Return ONLY the JSON object, no markdown formatting.
+        IMPORTANT: Use empty strings "" for missing values, do NOT use null.
+        """
+
+        # Create session ID
+        session_id = str(self.uuid.uuid4())
+
+        # Create runner
+        runner = self.Runner(
+            agent=self.agent, app_name=self.app_name, session_service=self.session_service
+        )
+
+        # Run async wrapper
+        import asyncio
+
+        async def run_agent():
+            # Create session async
+            await self.session_service.create_session(
+                app_name=self.app_name, session_id=session_id, user_id="user"
+            )
+
+            content = self.Content(role="user", parts=[self.Part(text=prompt)])
+            events_list = []
+            async for event in runner.run_async(
+                user_id="user", session_id=session_id, new_message=content
+            ):
+                events_list.append(event)
+            return events_list
+
+        try:
+            events = asyncio.run(run_agent())
+        except Exception as e:
+            self.logger.error(f"Async run failed: {e}")
+            raise e
+
+        response_text = ""
+        for event in events:
+            if hasattr(event, "content") and event.content and event.content.parts:
+                for part in event.content.parts:
+                    if part.text:
+                        response_text += part.text
+
+        # Parse JSON from response
+        import json
+        import re
+
+        # Extract JSON block if present
+        json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(0)
+            return json.loads(json_str)
+        else:
+            # Try parsing the whole response
+            return json.loads(response_text)

@@ -15,14 +15,36 @@ from core.utils import write_json_file
 class MatchAgent:
     """Agent responsible for matching resume with jobs and generating rankings."""
 
-    def __init__(self, model_name: str = "gemini-2.0-flash-exp"):
+    def __init__(self, model_name: str = "gemini-2.5-flash-lite"):
         self.model_name = model_name
         self.matcher = JobMatcher()
         self.logger = get_logger()
 
-        # Initialize ADK client (optional - for real LLM calls)
-        # For prototype, we use deterministic reasoning
-        self.use_llm = False
+        # Initialize ADK agent
+        self.use_llm = True
+        try:
+            import uuid
+
+            from google.adk import Runner
+            from google.adk.agents.llm_agent import Agent
+            from google.adk.sessions import InMemorySessionService
+            from google.genai.types import Content, Part
+
+            self.agent = Agent(
+                model=model_name,
+                name="match_explainer",
+                description="Explains job matches.",
+                instruction="You are an expert recruiter. Your goal is to explain why a candidate matches a job based on provided data.",
+            )
+            self.session_service = InMemorySessionService()
+            self.app_name = "agents"
+            self.Runner = Runner
+            self.Content = Content
+            self.Part = Part
+            self.uuid = uuid
+        except ImportError:
+            self.logger.error("google-adk not installed. Falling back to deterministic reasoning.")
+            self.use_llm = False
 
     def match_jobs(
         self,
@@ -100,9 +122,15 @@ class MatchAgent:
         Returns: (reason, evidence_snippets)
         """
         if self.use_llm:
-            return self._generate_with_llm(
-                resume, job, score, breakdown, matched_skills, missing_skills
-            )
+            try:
+                return self._generate_with_llm(
+                    resume, job, score, breakdown, matched_skills, missing_skills
+                )
+            except Exception as e:
+                self.logger.error(f"LLM explanation failed: {e}. Falling back to deterministic.")
+                return self._generate_deterministic(
+                    resume, job, score, breakdown, matched_skills, missing_skills
+                )
         else:
             return self._generate_deterministic(
                 resume, job, score, breakdown, matched_skills, missing_skills
@@ -120,6 +148,7 @@ class MatchAgent:
         """
         Generate explanation using rule-based logic.
         """
+        self.logger.info("Generating match explanation deterministically...")
         # Build reason text
         reason_parts = []
 
@@ -196,12 +225,87 @@ class MatchAgent:
         missing_skills: list[str],
     ) -> tuple[str, list[str]]:
         """
-        Generate explanation using LLM (for future implementation).
+        Generate explanation using LLM.
         """
+        self.logger.info("Generating match explanation with LLM...")
         self.logger.increment_metric("llm_calls")
 
-        # This would use ADK's LLM capabilities to generate natural language explanation
-        # For now, fall back to deterministic
-        return self._generate_deterministic(
-            resume, job, score, breakdown, matched_skills, missing_skills
+        prompt = f"""
+        Generate a human-readable explanation for why this candidate matches (or doesn't match) the job.
+
+        Candidate:
+        - Skills: {resume.skills}
+        - Experience: {resume.years_of_experience} years
+        - Seniority: {resume.seniority}
+
+        Job:
+        - Title: {job.title}
+        - Company: {job.company}
+        - Requirements: {job.requirements}
+
+        Match Score: {score}
+        Matched Skills: {matched_skills}
+        Missing Skills: {missing_skills}
+
+        Output a JSON object with:
+        {{
+            "reason": "A 2-3 sentence explanation of the match quality.",
+            "evidence_snippets": ["List of 3-5 short quotes from the job description that support the match"]
+        }}
+        """
+
+        # Create session ID
+        session_id = str(self.uuid.uuid4())
+
+        # Create runner
+        runner = self.Runner(
+            agent=self.agent, app_name=self.app_name, session_service=self.session_service
         )
+
+        # Run async wrapper
+        import asyncio
+
+        async def run_agent():
+            # Create session async
+            await self.session_service.create_session(
+                app_name=self.app_name, session_id=session_id, user_id="user"
+            )
+
+            content = self.Content(role="user", parts=[self.Part(text=prompt)])
+            events_list = []
+            async for event in runner.run_async(
+                user_id="user", session_id=session_id, new_message=content
+            ):
+                events_list.append(event)
+            return events_list
+
+        try:
+            events = asyncio.run(run_agent())
+        except Exception as e:
+            self.logger.error(f"Async run failed: {e}")
+            raise e
+
+        response_text = ""
+        for event in events:
+            if hasattr(event, "content") and event.content and event.content.parts:
+                for part in event.content.parts:
+                    if part.text:
+                        response_text += part.text
+
+        # Parse JSON
+        import json
+        import re
+
+        json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(0)
+            data = json.loads(json_str)
+            return data.get("reason", ""), data.get("evidence_snippets", [])
+        else:
+            # Try parsing the whole response
+            try:
+                data = json.loads(response_text)
+                return data.get("reason", ""), data.get("evidence_snippets", [])
+            except json.JSONDecodeError:
+                # If not valid JSON, just return the text as reason
+                return response_text, []
