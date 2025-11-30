@@ -1,20 +1,26 @@
 """Unit tests for core modules."""
-import unittest
-import json
-from pathlib import Path
-import tempfile
-import shutil
 
-from core.parsing_schemas import ResumeSchema, JobSchema, Contact, ScoreBreakdown
+import shutil
+import tempfile
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
 from core.embeddings import DeterministicEmbeddings
+from core.logger import JobMatchLogger
+from core.parsing_schemas import Contact, JobSchema, ResumeSchema, ScoreBreakdown
 from core.scoring import JobMatcher
 from core.utils import CacheManager
-from core.logger import JobMatchLogger
+
+# ============================================================================
+# Test Parsing Schemas
+# ============================================================================
 
 
-class TestParsingSchemas(unittest.TestCase):
+class TestParsingSchemas:
     """Test data schemas."""
-    
+
     def test_resume_schema_validation(self):
         """Test resume schema creation and validation."""
         resume_data = {
@@ -28,14 +34,14 @@ class TestParsingSchemas(unittest.TestCase):
             "education": ["Master's degree"],
             "projects": ["Project 1"],
             "preferred_location": "France",
-            "other_notes": "Test notes"
+            "other_notes": "Test notes",
         }
-        
+
         resume = ResumeSchema(**resume_data)
-        self.assertEqual(resume.name, "Test User")
-        self.assertEqual(resume.years_of_experience, 5)
-        self.assertEqual(len(resume.skills), 2)
-    
+        assert resume.name == "Test User"
+        assert resume.years_of_experience == 5
+        assert len(resume.skills) == 2
+
     def test_job_schema_validation(self):
         """Test job schema creation and validation."""
         job_data = {
@@ -48,13 +54,13 @@ class TestParsingSchemas(unittest.TestCase):
             "requirements": ["5+ years Python", "Docker experience"],
             "nice_to_have": ["AWS experience"],
             "seniority": "Senior",
-            "raw_text": "Test job description"
+            "raw_text": "Test job description",
         }
-        
+
         job = JobSchema(**job_data)
-        self.assertEqual(job.title, "Senior Python Developer")
-        self.assertEqual(len(job.requirements), 2)
-    
+        assert job.title == "Senior Python Developer"
+        assert len(job.requirements) == 2
+
     def test_score_breakdown_validation(self):
         """Test score breakdown validation."""
         breakdown = ScoreBreakdown(
@@ -62,223 +68,248 @@ class TestParsingSchemas(unittest.TestCase):
             experience_alignment=25.0,
             seniority_fit=8.0,
             location_language=9.0,
-            semantic_alignment=7.0
+            semantic_alignment=7.0,
         )
-        
-        self.assertEqual(breakdown.skill_match, 35.0)
-        
+
+        assert breakdown.skill_match == 35.0
+
         # Test bounds
-        with self.assertRaises(Exception):
+        with pytest.raises(ValidationError):
             ScoreBreakdown(skill_match=50.0)  # Over max
 
 
-class TestEmbeddings(unittest.TestCase):
+# ============================================================================
+# Test Embeddings
+# ============================================================================
+
+
+@pytest.fixture
+def embeddings():
+    """Create embeddings instance for testing."""
+    return DeterministicEmbeddings()
+
+
+class TestEmbeddings:
     """Test embedding functionality."""
-    
-    def setUp(self):
-        self.embeddings = DeterministicEmbeddings()
-    
-    def test_embed_text(self):
+
+    def test_embed_text(self, embeddings):
         """Test text embedding."""
         text = "Python developer with 5 years experience"
-        embedding = self.embeddings.embed_text(text)
-        
-        self.assertEqual(len(embedding), 384)
-        self.assertIsInstance(embedding[0], float)
-    
-    def test_embedding_deterministic(self):
+        embedding = embeddings.embed_text(text)
+
+        assert len(embedding) == 384
+        assert isinstance(embedding[0], float)
+
+    def test_embedding_deterministic(self, embeddings):
         """Test that embeddings are deterministic."""
         text = "Test text"
-        emb1 = self.embeddings.embed_text(text)
-        emb2 = self.embeddings.embed_text(text)
-        
-        self.assertTrue((emb1 == emb2).all())
-    
-    def test_cosine_similarity(self):
+        emb1 = embeddings.embed_text(text)
+        emb2 = embeddings.embed_text(text)
+
+        assert (emb1 == emb2).all()
+
+    def test_cosine_similarity(self, embeddings):
         """Test cosine similarity calculation."""
         text1 = "Python developer"
         text2 = "Python engineer"
-        text3 = "Java developer"
-        
-        sim_12 = self.embeddings.cosine_similarity(text1, text2)
-        sim_13 = self.embeddings.cosine_similarity(text1, text3)
-        
-        self.assertIsInstance(sim_12, float)
-        self.assertGreaterEqual(sim_12, -1.0)
-        self.assertLessEqual(sim_12, 1.0)
+
+        sim_12 = embeddings.cosine_similarity(text1, text2)
+
+        assert isinstance(sim_12, float)
+        assert -1.0 <= sim_12 <= 1.0
 
 
-class TestScoring(unittest.TestCase):
+# ============================================================================
+# Test Scoring
+# ============================================================================
+
+
+@pytest.fixture
+def matcher():
+    """Create job matcher instance for testing."""
+    return JobMatcher()
+
+
+@pytest.fixture
+def sample_resume():
+    """Create sample resume for testing."""
+    return ResumeSchema(
+        name="Test Candidate",
+        contact=Contact(email="test@test.com", location="Paris"),
+        years_of_experience=5,
+        seniority="Senior",
+        skills=["Python", "Docker", "FastAPI", "PostgreSQL"],
+        domains=["AI", "Data Engineering"],
+        languages=["English", "French"],
+        education=["Master's degree"],
+        projects=["ML project"],
+        preferred_location="France",
+    )
+
+
+@pytest.fixture
+def sample_job():
+    """Create sample job for testing."""
+    return JobSchema(
+        id="test_job",
+        title="Senior Python Developer",
+        company="Test Corp",
+        location="Paris, France",
+        responsibilities="Build Python applications",
+        requirements=["Python", "Docker", "5+ years experience"],
+        nice_to_have=["AWS"],
+        seniority="Senior",
+        raw_text="Test job",
+    )
+
+
+class TestScoring:
     """Test scoring logic."""
-    
-    def setUp(self):
-        self.matcher = JobMatcher()
-        
-        self.resume = ResumeSchema(
-            name="Test Candidate",
-            contact=Contact(email="test@test.com", location="Paris"),
-            years_of_experience=5,
-            seniority="Senior",
-            skills=["Python", "Docker", "FastAPI", "PostgreSQL"],
-            domains=["AI", "Data Engineering"],
-            languages=["English", "French"],
-            education=["Master's degree"],
-            projects=["ML project"],
-            preferred_location="France"
-        )
-        
-        self.job = JobSchema(
-            id="test_job",
-            title="Senior Python Developer",
-            company="Test Corp",
-            location="Paris, France",
-            responsibilities="Build Python applications",
-            requirements=["Python", "Docker", "5+ years experience"],
-            nice_to_have=["AWS"],
-            seniority="Senior",
-            raw_text="Test job"
-        )
-    
-    def test_skill_match_calculation(self):
+
+    def test_skill_match_calculation(self, matcher, sample_resume, sample_job):
         """Test skill matching score."""
-        score, matched, missing = self.matcher.calculate_skill_match(
-            self.resume, self.job
-        )
-        
-        self.assertGreaterEqual(score, 0)
-        self.assertLessEqual(score, 40)
-        self.assertIsInstance(matched, list)
-        self.assertIsInstance(missing, list)
-    
-    def test_experience_alignment(self):
+        score, matched, missing = matcher.calculate_skill_match(sample_resume, sample_job)
+
+        assert 0 <= score <= 40
+        assert isinstance(matched, list)
+        assert isinstance(missing, list)
+
+    def test_experience_alignment(self, matcher, sample_resume, sample_job):
         """Test experience alignment score."""
-        score = self.matcher.calculate_experience_alignment(
-            self.resume, self.job
-        )
-        
-        self.assertGreaterEqual(score, 0)
-        self.assertLessEqual(score, 30)
-    
-    def test_seniority_fit(self):
+        score = matcher.calculate_experience_alignment(sample_resume, sample_job)
+
+        assert 0 <= score <= 30
+
+    def test_seniority_fit(self, matcher, sample_resume, sample_job):
         """Test seniority fit score."""
-        score = self.matcher.calculate_seniority_fit(
-            self.resume, self.job
-        )
-        
-        self.assertGreaterEqual(score, 0)
-        self.assertLessEqual(score, 10)
-    
-    def test_location_language_fit(self):
+        score = matcher.calculate_seniority_fit(sample_resume, sample_job)
+
+        assert 0 <= score <= 10
+
+    def test_location_language_fit(self, matcher, sample_resume, sample_job):
         """Test location and language fit score."""
-        score = self.matcher.calculate_location_language_fit(
-            self.resume, self.job
-        )
-        
-        self.assertGreaterEqual(score, 0)
-        self.assertLessEqual(score, 10)
-    
-    def test_semantic_similarity(self):
+        score = matcher.calculate_location_language_fit(sample_resume, sample_job)
+
+        assert 0 <= score <= 10
+
+    def test_semantic_similarity(self, matcher, sample_resume, sample_job):
         """Test semantic similarity score."""
-        score = self.matcher.calculate_semantic_similarity(
-            self.resume, self.job
-        )
-        
-        self.assertGreaterEqual(score, 0)
-        self.assertLessEqual(score, 10)
-    
-    def test_overall_match_score(self):
+        score = matcher.calculate_semantic_similarity(sample_resume, sample_job)
+
+        assert 0 <= score <= 10
+
+    def test_overall_match_score(self, matcher, sample_resume, sample_job):
         """Test overall match score calculation."""
-        score, breakdown, matched, missing = self.matcher.calculate_match_score(
-            self.resume, self.job
+        score, breakdown, matched, missing = matcher.calculate_match_score(
+            sample_resume, sample_job
         )
-        
-        self.assertGreaterEqual(score, 0)
-        self.assertLessEqual(score, 100)
-        self.assertIsInstance(breakdown, ScoreBreakdown)
-    
-    def test_success_likelihood(self):
+
+        assert 0 <= score <= 100
+        assert isinstance(breakdown, ScoreBreakdown)
+
+    def test_success_likelihood(self, matcher):
         """Test success likelihood determination."""
-        high = self.matcher.determine_success_likelihood(80)
-        medium = self.matcher.determine_success_likelihood(60)
-        low = self.matcher.determine_success_likelihood(40)
-        
-        self.assertEqual(high, "High")
-        self.assertEqual(medium, "Medium")
-        self.assertEqual(low, "Low")
+        high = matcher.determine_success_likelihood(80)
+        medium = matcher.determine_success_likelihood(60)
+        low = matcher.determine_success_likelihood(40)
+
+        assert high == "High"
+        assert medium == "Medium"
+        assert low == "Low"
 
 
-class TestCacheManager(unittest.TestCase):
+# ============================================================================
+# Test Cache Manager
+# ============================================================================
+
+
+@pytest.fixture
+def temp_cache_dir():
+    """Create temporary cache directory."""
+    temp_dir = tempfile.mkdtemp()
+    yield temp_dir
+    shutil.rmtree(temp_dir)
+
+
+@pytest.fixture
+def cache_manager(temp_cache_dir):
+    """Create cache manager instance for testing."""
+    return CacheManager(cache_dir=temp_cache_dir)
+
+
+class TestCacheManager:
     """Test cache management."""
-    
-    def setUp(self):
-        self.temp_dir = tempfile.mkdtemp()
-        self.cache = CacheManager(cache_dir=self.temp_dir)
-    
-    def tearDown(self):
-        shutil.rmtree(self.temp_dir)
-    
-    def test_cache_set_and_get(self):
+
+    def test_cache_set_and_get(self, cache_manager):
         """Test setting and getting cache."""
         key = "test_key"
         data = {"test": "data", "value": 123}
-        
-        result = self.cache.set(key, data, prefix="test")
-        self.assertTrue(result)
-        
-        cached = self.cache.get(key, prefix="test")
-        self.assertIsNotNone(cached)
-        self.assertEqual(cached['data'], data)
-    
-    def test_cache_exists(self):
+
+        result = cache_manager.set(key, data, prefix="test")
+        assert result is True
+
+        cached = cache_manager.get(key, prefix="test")
+        assert cached is not None
+        assert cached["data"] == data
+
+    def test_cache_exists(self, cache_manager):
         """Test cache existence check."""
         key = "test_key"
         data = {"test": "data"}
-        
-        self.assertFalse(self.cache.exists(key, prefix="test"))
-        
-        self.cache.set(key, data, prefix="test")
-        self.assertTrue(self.cache.exists(key, prefix="test"))
-    
-    def test_cache_clear(self):
+
+        assert cache_manager.exists(key, prefix="test") is False
+
+        cache_manager.set(key, data, prefix="test")
+        assert cache_manager.exists(key, prefix="test") is True
+
+    def test_cache_clear(self, cache_manager):
         """Test cache clearing."""
-        self.cache.set("key1", {"data": 1}, prefix="test")
-        self.cache.set("key2", {"data": 2}, prefix="test")
-        
-        self.cache.clear(prefix="test")
-        
-        self.assertFalse(self.cache.exists("key1", prefix="test"))
-        self.assertFalse(self.cache.exists("key2", prefix="test"))
+        cache_manager.set("key1", {"data": 1}, prefix="test")
+        cache_manager.set("key2", {"data": 2}, prefix="test")
+
+        cache_manager.clear(prefix="test")
+
+        assert cache_manager.exists("key1", prefix="test") is False
+        assert cache_manager.exists("key2", prefix="test") is False
 
 
-class TestLogger(unittest.TestCase):
+# ============================================================================
+# Test Logger
+# ============================================================================
+
+
+@pytest.fixture
+def temp_log_dir():
+    """Create temporary log directory."""
+    temp_dir = tempfile.mkdtemp()
+    yield temp_dir
+    shutil.rmtree(temp_dir)
+
+
+@pytest.fixture
+def logger(temp_log_dir):
+    """Create logger instance for testing."""
+    return JobMatchLogger(name="test_logger", log_dir=temp_log_dir)
+
+
+class TestLogger:
     """Test logger functionality."""
-    
-    def setUp(self):
-        self.temp_dir = tempfile.mkdtemp()
-        self.logger = JobMatchLogger(name="test_logger", log_dir=self.temp_dir)
-    
-    def tearDown(self):
-        shutil.rmtree(self.temp_dir)
-    
-    def test_logging(self):
+
+    def test_logging(self, logger, temp_log_dir):
         """Test basic logging functionality."""
-        self.logger.info("Test info message")
-        self.logger.debug("Test debug message")
-        self.logger.warning("Test warning message")
-        
+        logger.info("Test info message")
+        logger.debug("Test debug message")
+        logger.warning("Test warning message")
+
         # Check log file was created
-        log_files = list(Path(self.temp_dir).glob("*.log"))
-        self.assertGreater(len(log_files), 0)
-    
-    def test_metrics(self):
+        log_files = list(Path(temp_log_dir).glob("*.log"))
+        assert len(log_files) > 0
+
+    def test_metrics(self, logger):
         """Test metrics tracking."""
-        self.logger.increment_metric('resumes_parsed', 1)
-        self.logger.increment_metric('jobs_parsed', 3)
-        
-        metrics = self.logger.get_metrics()
-        self.assertEqual(metrics['resumes_parsed'], 1)
-        self.assertEqual(metrics['jobs_parsed'], 3)
+        logger.increment_metric("resumes_parsed", 1)
+        logger.increment_metric("jobs_parsed", 3)
 
-
-if __name__ == '__main__':
-    unittest.main()
+        metrics = logger.get_metrics()
+        assert metrics["resumes_parsed"] == 1
+        assert metrics["jobs_parsed"] == 3

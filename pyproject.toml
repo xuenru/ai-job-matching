@@ -46,7 +46,7 @@ dev = [
 
 [tool.black]
 line-length = 100
-target-version = ['py38', 'py39', 'py310', 'py311']
+target-version = 'py312'
 include = '\.pyi?$'
 extend-exclude = '''
 /(
@@ -72,7 +72,7 @@ known_first_party = ["agents", "core", "workflows"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py38"
+target-version = "py312"
 exclude = [
     ".git",
     ".mypy_cache",
