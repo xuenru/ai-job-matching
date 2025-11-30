@@ -240,7 +240,7 @@ The system generates `output/ranked_jobs.json` with the following structure:
         "semantic_alignment": 7.5
       },
       "title": "Senior AI Engineer",
-      "company": "Inato",
+      "company": "Google",
       "location": "Paris, France",
       "reason": "Excellent match with strong alignment...",
       "matched_skills": ["Python", "LangChain", "Docker", ...],
@@ -412,7 +412,7 @@ python cli.py clear-cache
 
 ## Future Enhancements
 
-- [ ] Real LLM integration for parsing
+- [ ] **Crawler Agent**: Scrape relevant job postings from web sources
 - [ ] Google Search integration via MCP
 - [ ] Historical ranking analysis
 - [ ] A/B testing framework
